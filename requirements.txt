@@ -1,8 +1,10 @@
-pandas
 streamlit
+pandas
 torch
-bertalign
 unbabel-comet
 python-docx
 pdfplumber
 wtpsplit
+# Use the git version of bertalign to ensure compatibility
+git+https://github.com/bfsujason/bertalign.git
+laser_encoders
