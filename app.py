@@ -8,13 +8,13 @@ from typing import List, Tuple, Optional
 import pandas as pd
 import streamlit as st
 
-# Safety check for imports to guide the user
+# Dependency Check
 try:
     import torch
     from comet import download_model, load_from_checkpoint
     from bertalign import Bertalign
 except ImportError as e:
-    st.error(f"Erreur de dépendance : {e}. Assurez-vous d'avoir un fichier requirements.txt.")
+    st.error(f"Missing dependency: {e}. Make sure requirements.txt is in your GitHub repo.")
     st.stop()
 
 # ---- UI config ----
@@ -25,7 +25,6 @@ st.title("LQA — Alignement Strict • Évaluation (COMET / XCOMET)")
 # Utils: I/O
 # =========================
 def read_uploaded_text(file) -> str:
-    """Read text from uploaded file (.txt, .md, .csv, .docx, .pdf)."""
     name = (file.name or "").lower()
     data = file.getvalue()
     
@@ -81,9 +80,9 @@ def align_texts_strict(src_text: str, tgt_text: str) -> List[Tuple[str, str]]:
                 pairs.append((src_line.strip(), tgt_line.strip()))
             return pairs
         else:
-            raise ValueError("Bertalign n'a produit aucun résultat.")
+            raise ValueError("Bertalign produced no results.")
     except Exception as e:
-        st.error(f"Erreur Bertalign : {e}")
+        st.error(f"Bertalign Error: {e}")
         raise e
 
 # =========================
@@ -108,51 +107,73 @@ if "aligned_df" not in st.session_state:
 col_src, col_mt, col_ref = st.columns(3)
 
 with col_src:
-    up_src = st.file_uploader("Source", key="src")
+    up_src = st.file_uploader("Source (Fichier d'origine)", key="src")
 with col_mt:
-    up_mt = st.file_uploader("Traduction", key="mt")
+    up_mt = st.file_uploader("Cible (Traduction MT)", key="mt")
 with col_ref:
-    up_ref = st.file_uploader("Référence (XCOMET)", key="ref")
+    up_ref = st.file_uploader("Référence (Optionnel)", key="ref")
 
 if up_src and up_mt:
     src_txt = read_uploaded_text(up_src)
     mt_txt = read_uploaded_text(up_mt)
     ref_txt = read_uploaded_text(up_ref) if up_ref else None
 
-    metrics = ["COMETKiwi (Sans réf)", "XCOMET-XL (Avec réf)"]
+    metrics = ["COMETKiwi (QE - Sans Référence)", "XCOMET-XL (Avec Référence)"]
     choice = st.selectbox("Métrique", options=metrics)
     needs_ref = "XCOMET" in choice
+    # Use smaller models if Streamlit Cloud crashes due to RAM limits
     model_id = "Unbabel/wmt22-cometkiwi-da" if not needs_ref else "Unbabel/XCOMET-XL"
 
-    if st.button("Lancer l'analyse", type="primary"):
+    if st.button("Lancer l'analyse LQA", type="primary"):
         if needs_ref and not ref_txt:
-            st.error("Référence manquante.")
+            st.error("XCOMET nécessite un fichier de référence.")
         else:
-            # 1. Align MT
-            with st.spinner("Alignement MT..."):
-                pairs = align_texts_strict(src_txt, mt_txt)
-                df = pd.DataFrame(pairs, columns=["source", "traduction"])
-            
-            # 2. Align Ref if needed
-            if needs_ref:
-                with st.spinner("Alignement Référence..."):
-                    ref_pairs = align_texts_strict(src_txt, ref_txt)
-                    ref_map = {p[0]: p[1] for p in ref_pairs}
-                    df["reference"] = df["source"].map(ref_map).fillna("")
+            try:
+                # 1. Align Translation
+                with st.spinner("Alignement Bertalign (Source <> Traduction)..."):
+                    pairs = align_texts_strict(src_txt, mt_txt)
+                    df = pd.DataFrame(pairs, columns=["source", "traduction"])
+                
+                # 2. Align Reference to Source (Required for COMET segment matching)
+                if needs_ref:
+                    with st.spinner("Alignement Bertalign (Source <> Référence)..."):
+                        ref_pairs = align_texts_strict(src_txt, ref_txt)
+                        ref_map = {p[0]: p[1] for p in ref_pairs}
+                        df["reference"] = df["source"].map(ref_map).fillna("")
 
-            # 3. Score
-            with st.spinner("Évaluation..."):
-                model = load_comet_model(model_id)
-                eval_data = [{"src": r.source, "mt": r.traduction, "ref": r.get("reference", "")} for r in df.itertuples()]
-                df["score"] = score_with_comet(model, eval_data)
-                st.session_state.aligned_df = df
+                # 3. Predict Scores
+                with st.spinner(f"Évaluation via {model_id}..."):
+                    model = load_comet_model(model_id)
+                    eval_data = []
+                    for r in df.itertuples():
+                        item = {"src": r.source, "mt": r.traduction}
+                        if needs_ref:
+                            item["ref"] = getattr(r, "reference", "")
+                        eval_data.append(item)
+                    
+                    df["score"] = score_with_comet(model, eval_data)
+                    st.session_state.aligned_df = df
+                    st.success("Analyse terminée.")
 
+            except Exception as e:
+                st.error(f"Une erreur est survenue : {e}")
+
+    # Results Section
     if st.session_state.aligned_df is not None:
         df = st.session_state.aligned_df
-        st.metric("Score Global", f"{df['score'].mean():.3f}")
         
-        # Highlight low scores
-        st.dataframe(df.style.background_gradient(subset=['score'], cmap="RdYlGn"), use_container_width=True)
+        st.markdown("---")
+        st.metric("Score Global Moyen", f"{df['score'].mean():.3f}")
         
+        # Color Scale for the Score column
+        st.subheader("Segments et Métriques LQA")
+        st.dataframe(
+            df.style.background_gradient(subset=['score'], cmap="RdYlGn", vmin=0, vmax=1), 
+            use_container_width=True
+        )
+        
+        # CSV Download
         csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("Télécharger CSV", data=csv, file_name="lqa_results.csv")
+        st.download_button("Exporter les résultats (CSV)", data=csv, file_name="lqa_output.csv", mime="text/csv")
+else:
+    st.info("Veuillez charger vos fichiers pour débuter l'alignement Bertalign.")
