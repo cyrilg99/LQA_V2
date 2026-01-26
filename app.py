@@ -7,25 +7,33 @@ from typing import List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
-import torch
+
+# Safety check for imports to guide the user
+try:
+    import torch
+    from comet import download_model, load_from_checkpoint
+    from bertalign import Bertalign
+except ImportError as e:
+    st.error(f"Erreur de dépendance : {e}. Assurez-vous d'avoir un fichier requirements.txt.")
+    st.stop()
 
 # ---- UI config ----
-st.set_page_config(page_title="LQA — Alignement + Évaluation (COMET/XCOMET)", layout="wide")
-st.title("LQA — Upload • Alignement • Évaluation (COMET / XCOMET)")
+st.set_page_config(page_title="LQA — Bertalign + COMET", layout="wide")
+st.title("LQA — Alignement Strict • Évaluation (COMET / XCOMET)")
 
 # =========================
-# Utils: I/O & preprocessing
+# Utils: I/O
 # =========================
 def read_uploaded_text(file) -> str:
-    """Read text from uploaded file (.txt, .md, .csv as plain text; .docx optional; .pdf optional)."""
+    """Read text from uploaded file (.txt, .md, .csv, .docx, .pdf)."""
     name = (file.name or "").lower()
     data = file.getvalue()
-    for ext in (".txt", ".md", ".csv", ".tsv"):
-        if name.endswith(ext):
-            try:
-                return data.decode("utf-8", errors="ignore")
-            except Exception:
-                return data.decode("latin-1", errors="ignore")
+    
+    if name.endswith((".txt", ".md", ".csv", ".tsv")):
+        try:
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return data.decode("latin-1", errors="ignore")
 
     if name.endswith(".docx"):
         try:
@@ -36,8 +44,7 @@ def read_uploaded_text(file) -> str:
             doc = docx.Document(tmp_path)
             os.unlink(tmp_path)
             return "\n".join([p.text for p in doc.paragraphs])
-        except Exception as e:
-            st.warning(f"Impossible de lire DOCX ({e}).")
+        except Exception:
             return ""
 
     if name.endswith(".pdf"):
@@ -52,157 +59,100 @@ def read_uploaded_text(file) -> str:
                     acc.append(page.extract_text() or "")
             os.unlink(tmp_path)
             return "\n".join(acc)
-        except Exception as e:
-            st.warning(f"Impossible de lire PDF ({e}).")
+        except Exception:
             return ""
 
-    try:
-        return data.decode("utf-8", errors="ignore")
-    except Exception:
-        return data.decode("latin-1", errors="ignore")
+    return data.decode("utf-8", errors="ignore")
 
 # =========================
-# Alignment: Bertalign (Strict)
+# Alignment: Strict Bertalign
 # =========================
-def align_texts_strict_bertalign(src_text: str, tgt_text: str) -> List[Tuple[str, str]]:
-    """
-    Strictly uses Bertalign for alignment. 
-    If it fails or is not installed, it raises an exception.
-    """
+def align_texts_strict(src_text: str, tgt_text: str) -> List[Tuple[str, str]]:
+    """Strictly uses Bertalign; fails if alignment cannot be performed."""
     try:
-        from bertalign import Bertalign
-        
-        # Initialize Bertalign
-        # It handles sentence splitting internally or uses the text provided.
         aligner = Bertalign(src_text, tgt_text)
         aligner.align_sents()
         
         pairs = []
         if hasattr(aligner, "result") and aligner.result:
             for bead in aligner.result:
-                # Reconstruct the aligned lines based on indices
                 src_line = aligner._get_line(bead[0], aligner.src_sents)
                 tgt_line = aligner._get_line(bead[1], aligner.tgt_sents)
                 pairs.append((src_line.strip(), tgt_line.strip()))
             return pairs
         else:
             raise ValueError("Bertalign n'a produit aucun résultat.")
-            
-    except ImportError:
-        st.error("❌ La bibliothèque 'bertalign' n'est pas installée. Exécutez : pip install bertalign")
-        raise
     except Exception as e:
-        st.error(f"❌ Erreur lors de l'alignement avec Bertalign : {str(e)}")
-        raise
+        st.error(f"Erreur Bertalign : {e}")
+        raise e
 
 # =========================
-# COMET / XCOMET scoring
+# COMET Scoring
 # =========================
 @st.cache_resource(show_spinner=True)
 def load_comet_model(model_id: str):
-    from comet import download_model, load_from_checkpoint
     ckpt = download_model(model_id)
-    model = load_from_checkpoint(ckpt)
-    return model
+    return load_from_checkpoint(ckpt)
 
-def score_with_comet(model, data: List[dict], batch_size: int = 8, gpus: int = 0):
-    out = model.predict(data, batch_size=batch_size, gpus=gpus)
-    return out.scores, getattr(out, "system_score", None), getattr(out, "metadata", {})
+def score_with_comet(model, data: List[dict], batch_size: int = 8):
+    gpu_count = 1 if torch.cuda.is_available() else 0
+    out = model.predict(data, batch_size=batch_size, gpus=gpu_count)
+    return out.scores
 
 # =========================
-# UI — Main Logic
+# UI Main Logic
 # =========================
 if "aligned_df" not in st.session_state:
     st.session_state.aligned_df = None
 
-col_src, col_mt, col_ref = st.columns([1, 1, 1])
+col_src, col_mt, col_ref = st.columns(3)
 
 with col_src:
-    st.subheader("Source")
-    up_src = st.file_uploader("Fichier source", key="src_file")
-
+    up_src = st.file_uploader("Source", key="src")
 with col_mt:
-    st.subheader("Traduction")
-    up_mt = st.file_uploader("Fichier traduction", key="mt_file")
-
+    up_mt = st.file_uploader("Traduction", key="mt")
 with col_ref:
-    st.subheader("Référence")
-    up_ref = st.file_uploader("Référence (optionnelle)", key="ref_file")
+    up_ref = st.file_uploader("Référence (XCOMET)", key="ref")
 
 if up_src and up_mt:
-    # 1. READ TEXTS
-    src_text = read_uploaded_text(up_src)
-    mt_text  = read_uploaded_text(up_mt)
-    ref_text = read_uploaded_text(up_ref) if up_ref else None
+    src_txt = read_uploaded_text(up_src)
+    mt_txt = read_uploaded_text(up_mt)
+    ref_txt = read_uploaded_text(up_ref) if up_ref else None
 
-    st.markdown("---")
-    
-    # 2. METRIC SELECTION
-    metrics = ["COMETKiwi (QE, sans référence)", "XCOMET-XL (avec référence)"]
-    choice = st.selectbox("Choisir la métrique d'évaluation", options=metrics)
+    metrics = ["COMETKiwi (Sans réf)", "XCOMET-XL (Avec réf)"]
+    choice = st.selectbox("Métrique", options=metrics)
     needs_ref = "XCOMET" in choice
     model_id = "Unbabel/wmt22-cometkiwi-da" if not needs_ref else "Unbabel/XCOMET-XL"
 
-    # 3. ACTION
-    if st.button("Lancer Bertalign + Évaluation", type="primary"):
-        if needs_ref and not ref_text:
-            st.error("⚠️ XCOMET nécessite un fichier de référence.")
+    if st.button("Lancer l'analyse", type="primary"):
+        if needs_ref and not ref_txt:
+            st.error("Référence manquante.")
         else:
-            try:
-                # Step 1: Strict Bertalign
-                with st.spinner("Alignement Bertalign (Source <> Traduction)..."):
-                    pairs = align_texts_strict_bertalign(src_text, mt_text)
-                    df = pd.DataFrame(pairs, columns=["source", "traduction"])
+            # 1. Align MT
+            with st.spinner("Alignement MT..."):
+                pairs = align_texts_strict(src_txt, mt_txt)
+                df = pd.DataFrame(pairs, columns=["source", "traduction"])
+            
+            # 2. Align Ref if needed
+            if needs_ref:
+                with st.spinner("Alignement Référence..."):
+                    ref_pairs = align_texts_strict(src_txt, ref_txt)
+                    ref_map = {p[0]: p[1] for p in ref_pairs}
+                    df["reference"] = df["source"].map(ref_map).fillna("")
 
-                # Step 2: Reference Alignment for XCOMET
-                if needs_ref and ref_text:
-                    with st.spinner("Alignement Bertalign (Source <> Référence)..."):
-                        ref_pairs = align_texts_strict_bertalign(src_text, ref_text)
-                        ref_map = {p[0]: p[1] for p in ref_pairs}
-                        df["reference"] = df["source"].map(ref_map).fillna("")
+            # 3. Score
+            with st.spinner("Évaluation..."):
+                model = load_comet_model(model_id)
+                eval_data = [{"src": r.source, "mt": r.traduction, "ref": r.get("reference", "")} for r in df.itertuples()]
+                df["score"] = score_with_comet(model, eval_data)
+                st.session_state.aligned_df = df
 
-                # Step 3: Scoring
-                with st.spinner(f"Chargement de {model_id} et évaluation..."):
-                    gpu_count = 1 if torch.cuda.is_available() else 0
-                    model = load_comet_model(model_id)
-                    
-                    eval_data = []
-                    for _, row in df.iterrows():
-                        item = {"src": row["source"], "mt": row["traduction"]}
-                        if needs_ref:
-                            item["ref"] = row.get("reference", "")
-                        eval_data.append(item)
-
-                    scores, sys_score, meta = score_with_comet(model, eval_data, gpus=gpu_count)
-                    df["score"] = scores
-                    st.session_state.aligned_df = df
-                    st.success("Analyse terminée avec succès.")
-
-            except Exception:
-                st.error("L'analyse a été interrompue en raison d'une erreur d'alignement.")
-
-    # 4. RESULTS DISPLAY
     if st.session_state.aligned_df is not None:
         df = st.session_state.aligned_df
+        st.metric("Score Global", f"{df['score'].mean():.3f}")
         
-        st.markdown("---")
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            st.metric("Score Global (COMET)", f"{df['score'].mean():.3f}")
+        # Highlight low scores
+        st.dataframe(df.style.background_gradient(subset=['score'], cmap="RdYlGn"), use_container_width=True)
         
-        # LQA Visual Thresholds
-        low_threshold = 0.45
-        
-        def style_rows(row):
-            if row['score'] < low_threshold:
-                return ['background-color: #ffe6e6'] * len(row)
-            return [''] * len(row)
-
-        st.subheader("Analyse détaillée des segments")
-        st.dataframe(df.style.apply(style_rows, axis=1), use_container_width=True)
-
-        # Export
         csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("Télécharger les résultats (CSV)", data=csv, file_name="lqa_bertalign_results.csv", mime="text/csv")
-else:
-    st.info("Téléversez les fichiers requis pour activer Bertalign.")
+        st.download_button("Télécharger CSV", data=csv, file_name="lqa_results.csv")
