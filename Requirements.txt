@@ -1,20 +1,8 @@
-
-# Web UI
-streamlit>=1.35
-
-# Segmentation
-wtpsplit>=1.5  # ou wtpsplit-lite si tu veux très léger
-
-# Alignement
-bertalign>=0.2.1
-
-# Évaluation
-unbabel-comet>=2.2.0
-torch>=2.1
-transformers>=4.36
-sentencepiece>=0.1.99
-
-# Lecture de fichiers
-pandas>=2.2
-python-docx>=1.1.0
-pdfplumber>=0.11
+pandas
+streamlit
+torch
+bertalign
+unbabel-comet
+python-docx
+pdfplumber
+wtpsplit
