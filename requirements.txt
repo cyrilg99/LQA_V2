@@ -1,13 +1,5 @@
-pandas
-streamlit
-# Use CPU-only torch to stay within Streamlit's 1GB RAM limit
-torch --index-url https://download.pytorch.org/whl/cpu
-# Required for BERT and COMET
-sentence-transformers
-sentencepiece
-unbabel-comet
-python-docx
-pdfplumber
-# Install the latest Bertalign directly from GitHub for better stability
-git+https://github.com/bfsujason/bertalign.git
-laser_encoders
+PyTorch (CPU version)
+COMET quality metrics
+Bertalign for alignment
+Document processing libraries
+Excel export support
