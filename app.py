@@ -6,11 +6,21 @@ import pandas as pd
 import streamlit as st
 import torch
 
+# === HUGGING FACE AUTHENTICATION ===
+# This allows access to gated COMET models
+if "HUGGINGFACE_TOKEN" in st.secrets:
+    from huggingface_hub import login
+    try:
+        login(token=st.secrets["HUGGINGFACE_TOKEN"])
+        # Don't show success message to keep UI clean
+    except Exception as e:
+        st.warning(f"⚠️ Hugging Face authentication failed: {e}")
+        st.info("Some models may not be available without authentication.")
+
 # --- Dependencies Check ---
 try:
     from bertalign import Bertalign
     from comet import download_model, load_from_checkpoint
-    # NOTE: laser_encoders removed - not actually used in the code
 except ImportError as e:
     st.error(f"Missing dependency: {e}. Check your requirements.txt.")
     st.stop()
@@ -75,13 +85,21 @@ def align_texts_strict(src_text: str, tgt_text: str) -> List[Tuple[str, str]]:
 # =========================
 @st.cache_resource(show_spinner=True)
 def load_comet_model(model_id: str):
-    ckpt = download_model(model_id)
-    return load_from_checkpoint(ckpt)
+    try:
+        ckpt = download_model(model_id)
+        return load_from_checkpoint(ckpt)
+    except Exception as e:
+        st.error(f"❌ Error loading model '{model_id}'")
+        st.error(str(e))
+        if "401" in str(e) or "gated" in str(e).lower():
+            st.error("This model requires authentication. Please add your Hugging Face token to Streamlit Secrets.")
+            st.info("Go to Settings → Secrets and add: HUGGINGFACE_TOKEN = \"your_token\"")
+        raise
 
 def score_with_comet(model, data: list):
     gpu_count = 1 if torch.cuda.is_available() else 0
     # Use small batch size for Streamlit Cloud RAM limits
-    out = model.predict(data, batch_size=4, gpus=gpu_count)
+    out = model.predict(data, batch_size=2, gpus=gpu_count)
     return out.scores
 
 # =========================
@@ -103,33 +121,68 @@ if up_src and up_mt:
     mt_txt = read_uploaded_text(up_mt)
     ref_txt = read_uploaded_text(up_ref) if up_ref else None
 
-    metrics = ["COMETKiwi (QE)", "XCOMET-XL (Reference-based)"]
+    # All models available (if authenticated)
+    metrics = [
+        "COMETKiwi (QE - No Reference)",
+        "XCOMET-XL (Reference-based)",
+        "COMET-22 (Reference-based)"
+    ]
     choice = st.selectbox("Select Metric", options=metrics)
-    needs_ref = "XCOMET" in choice
-    model_id = "Unbabel/wmt22-cometkiwi-da" if not needs_ref else "Unbabel/XCOMET-XL"
+    needs_ref = "XCOMET" in choice or "COMET-22" in choice
+    
+    # Map to model IDs
+    if "COMETKiwi" in choice:
+        model_id = "Unbabel/wmt22-cometkiwi-da"
+    elif "XCOMET" in choice:
+        model_id = "Unbabel/XCOMET-XL"
+    else:
+        model_id = "Unbabel/wmt22-comet-da"
 
     if st.button("Run LQA Analysis", type="primary"):
         if needs_ref and not ref_txt:
-            st.error("Reference file is required for XCOMET.")
+            st.error("Reference file is required for this model.")
         else:
-            with st.spinner("Aligning with Bertalign..."):
-                pairs = align_texts_strict(src_txt, mt_txt)
-                df = pd.DataFrame(pairs, columns=["source", "translation"])
-            
-            if needs_ref:
-                with st.spinner("Aligning Reference..."):
-                    ref_pairs = align_texts_strict(src_txt, ref_txt)
-                    ref_map = {p[0]: p[1] for p in ref_pairs}
-                    df["reference"] = df["source"].map(ref_map).fillna("")
+            try:
+                with st.spinner("Aligning with Bertalign..."):
+                    pairs = align_texts_strict(src_txt, mt_txt)
+                    df = pd.DataFrame(pairs, columns=["source", "translation"])
+                
+                if needs_ref:
+                    with st.spinner("Aligning Reference..."):
+                        ref_pairs = align_texts_strict(src_txt, ref_txt)
+                        ref_map = {p[0]: p[1] for p in ref_pairs}
+                        df["reference"] = df["source"].map(ref_map).fillna("")
 
-            with st.spinner("Scoring with COMET..."):
-                model = load_comet_model(model_id)
-                eval_data = [{"src": r.source, "mt": r.translation, "ref": getattr(r, "reference", "")} for r in df.itertuples()]
-                df["score"] = score_with_comet(model, eval_data)
-                st.session_state.aligned_df = df
+                with st.spinner(f"Scoring with COMET ({choice})..."):
+                    model = load_comet_model(model_id)
+                    eval_data = [
+                        {
+                            "src": r.source,
+                            "mt": r.translation,
+                            "ref": getattr(r, "reference", "")
+                        }
+                        for r in df.itertuples()
+                    ]
+                    df["score"] = score_with_comet(model, eval_data)
+                    st.session_state.aligned_df = df
+                    st.success("✅ Analysis complete!")
+                    
+            except Exception as e:
+                st.error("Analysis failed. See error details above.")
+                import traceback
+                with st.expander("Show full error trace"):
+                    st.code(traceback.format_exc())
 
     if st.session_state.aligned_df is not None:
         df = st.session_state.aligned_df
         st.metric("System Average Score", f"{df['score'].mean():.4f}")
-        st.dataframe(df.style.background_gradient(subset=['score'], cmap="RdYlGn"), use_container_width=True)
-        st.download_button("Download CSV", df.to_csv(index=False), "lqa_results.csv")
+        st.dataframe(
+            df.style.background_gradient(subset=['score'], cmap="RdYlGn"),
+            use_container_width=True
+        )
+        st.download_button(
+            "Download CSV",
+            df.to_csv(index=False),
+            "lqa_results.csv",
+            mime="text/csv"
+        )
