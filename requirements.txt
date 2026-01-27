@@ -7,3 +7,4 @@ git+https://github.com/bfsujason/bertalign.git
 python-docx
 pdfplumber
 openpyxl
+sentence_transformers
