@@ -4,14 +4,25 @@ numpy==1.26.4
 torch==2.1.2
 unbabel-comet==2.2.2
 git+https://github.com/bfsujason/bertalign.git
+
+# Bertalign dependencies
+numba==0.60.0
+faiss-cpu==1.7.4
+googletrans==4.0.0rc1
+sentence-splitter==1.4
+
+# Shared dependencies (compatible versions)
 sentence-transformers==2.7.0
 transformers==4.40.2
-python-docx==1.1.0
-pdfplumber==0.10.3
-openpyxl==3.1.2
 sentencepiece==0.1.99
 sacrebleu==2.4.0
 huggingface-hub==0.23.0
-googletrans==4.0.2
-sentence-splitter==1.4
-faiss == 1.5.3
+
+# Document processing
+python-docx==1.1.0
+pdfplumber==0.10.3
+openpyxl==3.1.2
+
+# Additional
+nltk==3.8.1
+regex==2024.5.15
