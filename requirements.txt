@@ -1,5 +1,15 @@
-PyTorch (CPU version)
-COMET quality metrics
-Bertalign for alignment
-Document processing libraries
-Excel export support
+streamlit==1.31.0
+pandas==2.1.4
+numpy==1.24.3
+torch==2.1.0
+unbabel-comet==2.2.2
+bertalign==1.2.4
+python-docx==1.1.0
+pdfplumber==0.10.3
+openpyxl==3.1.2
+sentence-transformers==2.2.2
+transformers==4.36.0
+sentencepiece==0.1.99
+sacrebleu==2.3.1
+huggingface-hub==0.20.0
+protobuf==3.20.3
