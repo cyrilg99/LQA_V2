@@ -26,3 +26,4 @@ openpyxl==3.1.2
 # Additional
 nltk==3.8.1
 regex==2024.5.15
+laser-encoders 0.0.2
