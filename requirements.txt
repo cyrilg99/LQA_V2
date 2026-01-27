@@ -14,3 +14,4 @@ sacrebleu==2.4.0
 huggingface-hub==0.23.0
 googletrans==4.0.2
 sentence-splitter==1.4
+faiss == 1.5.3
