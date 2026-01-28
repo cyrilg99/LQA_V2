@@ -1,7 +1,6 @@
 import os
 import io
 import tempfile
-from typing import List, Tuple
 import pandas as pd
 import streamlit as st
 import torch
@@ -9,18 +8,16 @@ import gc
 
 # --- Dependencies Check ---
 try:
-    from bertalign import Bertalign
     from comet import download_model, load_from_checkpoint
 except ImportError as e:
     st.error(f"Missing dependency: {e}. Check your requirements.txt.")
     st.stop()
 
 # ---- UI config ----
-st.set_page_config(page_title="LQA — Bertalign + COMET", layout="wide")
-st.title("LQA — Alignement Strict • Évaluation (COMET / XCOMET)")
+st.set_page_config(page_title="LQA — COMET Scoring", layout="wide")
+st.title("LQA — COMET Quality Evaluation")
 
-# Display info banner
-st.info("💡 **Using public COMET models** - No authentication required!")
+st.info("📊 **Upload pre-aligned Excel files** with Source and MT columns")
 
 # =========================
 # Memory Management
@@ -32,55 +29,48 @@ def clear_memory():
         torch.cuda.empty_cache()
 
 # =========================
-# Utils: I/O
+# Excel Processing
 # =========================
-def read_uploaded_text(file) -> str:
-    name = (file.name or "").lower()
-    data = file.getvalue()
-    if name.endswith((".txt", ".md", ".csv", ".tsv")):
-        return data.decode("utf-8", errors="ignore")
-    if name.endswith(".docx"):
-        import docx
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
-        doc = docx.Document(tmp_path)
-        os.unlink(tmp_path)
-        return "\n".join([p.text for p in doc.paragraphs])
-    if name.endswith(".pdf"):
-        import pdfplumber
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
-        acc = []
-        with pdfplumber.open(tmp_path) as pdf:
-            for page in pdf.pages:
-                acc.append(page.extract_text() or "")
-        os.unlink(tmp_path)
-        return "\n".join(acc)
-    return data.decode("utf-8", errors="ignore")
-
-# =========================
-# Alignment: Strict Bertalign
-# =========================
-def align_texts_strict(src_text: str, tgt_text: str) -> List[Tuple[str, str]]:
+def read_excel_file(file) -> pd.DataFrame:
+    """
+    Read Excel file with source and MT columns.
+    Expected format:
+    - Column 1: Source segments
+    - Column 2: MT (translation) segments
+    - Optional Column 3: Reference segments
+    """
     try:
-        aligner = Bertalign(src_text, tgt_text)
-        aligner.align_sents()
+        # Read Excel file
+        df = pd.read_excel(file, engine='openpyxl')
         
-        pairs = []
-        if hasattr(aligner, "result") and aligner.result:
-            for bead in aligner.result:
-                src_line = aligner._get_line(bead[0], aligner.src_sents)
-                tgt_line = aligner._get_line(bead[1], aligner.tgt_sents)
-                if src_line.strip() and tgt_line.strip():
-                    pairs.append((src_line.strip(), tgt_line.strip()))
-            return pairs
-        else:
-            raise ValueError("Bertalign produced no results.")
+        # Validate columns
+        if len(df.columns) < 2:
+            raise ValueError("Excel file must have at least 2 columns (Source, MT)")
+        
+        # Rename columns for consistency
+        if len(df.columns) == 2:
+            df.columns = ['source', 'translation']
+        elif len(df.columns) >= 3:
+            df.columns = ['source', 'translation', 'reference'] + list(df.columns[3:])
+        
+        # Convert to string and clean
+        df['source'] = df['source'].astype(str).str.strip()
+        df['translation'] = df['translation'].astype(str).str.strip()
+        if 'reference' in df.columns:
+            df['reference'] = df['reference'].astype(str).str.strip()
+        
+        # Remove empty rows
+        df = df[(df['source'] != '') & (df['source'] != 'nan')]
+        df = df[(df['translation'] != '') & (df['translation'] != 'nan')]
+        
+        # Reset index
+        df = df.reset_index(drop=True)
+        
+        return df
+        
     except Exception as e:
-        st.error(f"Bertalign Alignment Error: {e}")
-        raise e
+        st.error(f"Error reading Excel file: {e}")
+        raise
 
 # =========================
 # COMET Scoring
@@ -108,7 +98,7 @@ def score_with_comet(model, data: list):
         gpu_count = 1 if torch.cuda.is_available() else 0
         
         # Use batch_size=1 for maximum safety on free tier
-        with st.spinner(f"Scoring {len(data)} segments (this may take a few minutes)..."):
+        with st.spinner(f"Scoring {len(data)} segments..."):
             out = model.predict(data, batch_size=1, gpus=gpu_count)
         return out.scores
     except Exception as e:
@@ -119,129 +109,168 @@ def score_with_comet(model, data: list):
 # =========================
 # Main UI Logic
 # =========================
-if "aligned_df" not in st.session_state:
-    st.session_state.aligned_df = None
+if "results_df" not in st.session_state:
+    st.session_state.results_df = None
 
-# Sidebar with model info
+# Sidebar with instructions
 with st.sidebar:
-    st.header("ℹ️ Available Models")
+    st.header("📋 Instructions")
     st.markdown("""
-    ### Public Models (No Auth)
+    ### Excel File Format
     
-    All models below are **publicly available** 
-    and work on Streamlit Cloud free tier:
+    Your Excel file should have:
     
-    - ✅ **COMET-22** (~1GB RAM)
-    - ✅ **eTranslation-COMET** (~1GB RAM)  
-    - ✅ **COMET-20** (~800MB RAM)
+    **Required columns:**
+    1. **Column A**: Source segments
+    2. **Column B**: MT/Translation segments
     
-    All require reference translation.
+    **Optional:**
+    3. **Column C**: Reference segments
+    
+    **Example:**
+    | Source | Translation | Reference |
+    |--------|-------------|-----------|
+    | Hello world | Bonjour monde | Bonjour le monde |
+    | How are you? | Comment allez-vous? | Comment vas-tu? |
     
     ---
     
-    ### Need QE (No Reference)?
+    ### Available Models
     
-    COMETKiwi requires authentication.
+    **Lightweight (Best for Free Tier):**
+    - ✅ COMET-22 (~1GB RAM)
+    - ✅ COMET-20 (~800MB RAM)
     
-    To use it:
-    1. Get HF token
-    2. Request access to model
-    3. Add token to Streamlit Secrets
+    **Reference Required:**
+    All public models require a reference 
+    translation in Column C.
     
-    [See documentation →](https://huggingface.co/Unbabel/wmt22-cometkiwi-da)
+    ---
+    
+    ### Memory Usage
+    
+    **Free Streamlit Cloud: 1GB RAM**
+    
+    Estimated capacity:
+    - Small files (<100 segments): ✅
+    - Medium (100-500): ✅
+    - Large (>500): ⚠️ May need splitting
     """)
 
-col_src, col_mt, col_ref = st.columns(3)
-with col_src:
-    up_src = st.file_uploader("📄 Source File", key="src")
-with col_mt:
-    up_mt = st.file_uploader("🔄 MT Output", key="mt")
-with col_ref:
-    up_ref = st.file_uploader("✅ Reference", key="ref", 
-                              help="Reference translation (required)")
+# File uploader
+st.subheader("📁 Upload Excel File")
 
-if up_src and up_mt:
-    src_txt = read_uploaded_text(up_src)
-    mt_txt = read_uploaded_text(up_mt)
-    ref_txt = read_uploaded_text(up_ref) if up_ref else None
+uploaded_file = st.file_uploader(
+    "Choose an Excel file (.xlsx)",
+    type=['xlsx', 'xls'],
+    help="Excel file with Source (A), Translation (B), and optionally Reference (C) columns"
+)
 
-    # ONLY PUBLIC MODELS - NO AUTHENTICATION NEEDED
-    st.subheader("Select Quality Metric")
-    
-    metrics = [
-        "COMET-22 (wmt22-comet-da) - Recommended",
-        "eTranslation-COMET - For EU Languages",
-        "COMET-20 (wmt20-comet-da) - Lighter/Faster"
-    ]
-    
-    choice = st.selectbox(
-        "Model",
-        options=metrics,
-        help="All models require reference translation"
-    )
-    
-    # Map to model IDs - ALL PUBLIC
-    if "wmt22-comet-da" in choice:
-        model_id = "Unbabel/wmt22-comet-da"
-    elif "eTranslation" in choice:
-        model_id = "Unbabel/eTranslation-COMET"
-    else:  # wmt20
-        model_id = "Unbabel/wmt20-comet-da"
-
-    # Show file info
-    if src_txt:
-        src_lines = len([l for l in src_txt.split('\n') if l.strip()])
-        st.caption(f"Source: {src_lines} lines")
-        if src_lines > 200:
-            st.warning(f"⚠️ Large file ({src_lines} lines). Consider splitting to avoid memory issues.")
-
-    if st.button("🚀 Run LQA Analysis", type="primary"):
-        if not ref_txt:
-            st.error("❌ Reference file is required for all public models.")
-            st.info("💡 Upload a reference translation to continue.")
+if uploaded_file is not None:
+    try:
+        # Read and display Excel file
+        with st.spinner("Reading Excel file..."):
+            df = read_excel_file(uploaded_file)
+        
+        st.success(f"✅ Loaded {len(df)} segments from Excel file")
+        
+        # Show preview
+        with st.expander("📄 Preview Data (first 10 rows)"):
+            st.dataframe(df.head(10), use_container_width=True)
+        
+        # Check for reference column
+        has_reference = 'reference' in df.columns and not df['reference'].isna().all()
+        
+        if has_reference:
+            st.info("✅ Reference column detected - can use reference-based models")
         else:
+            st.warning("⚠️ No reference column - only QE models available (require authentication)")
+        
+        # Model selection
+        st.subheader("📊 Select Quality Metric")
+        
+        if has_reference:
+            metrics = [
+                "COMET-22 (wmt22-comet-da) - Recommended",
+                "eTranslation-COMET - For EU Languages",
+                "COMET-20 (wmt20-comet-da) - Lighter/Faster"
+            ]
+        else:
+            metrics = [
+                "⚠️ No reference detected - Add Column C for reference-based models"
+            ]
+            st.error("Please add a reference column (Column C) to use public models")
+        
+        choice = st.selectbox(
+            "Model",
+            options=metrics,
+            disabled=not has_reference,
+            help="All public models require reference translation"
+        )
+        
+        # Map to model IDs
+        if has_reference:
+            if "wmt22-comet-da" in choice:
+                model_id = "Unbabel/wmt22-comet-da"
+            elif "eTranslation" in choice:
+                model_id = "Unbabel/eTranslation-COMET"
+            else:  # wmt20
+                model_id = "Unbabel/wmt20-comet-da"
+        
+        # Warning for large files
+        if len(df) > 500:
+            st.warning(f"⚠️ Large file ({len(df)} segments). Consider splitting to avoid memory issues.")
+        
+        # Run analysis button
+        if st.button("🚀 Run COMET Analysis", type="primary", disabled=not has_reference):
             try:
-                # Clear memory before starting
                 clear_memory()
                 
-                # Alignment
-                with st.spinner("🔗 Aligning source and MT with Bertalign..."):
-                    pairs = align_texts_strict(src_txt, mt_txt)
-                    st.success(f"✅ Aligned {len(pairs)} segment pairs")
-                    df = pd.DataFrame(pairs, columns=["source", "translation"])
+                # Prepare data for COMET
+                with st.spinner("Preparing data..."):
+                    eval_data = []
+                    for idx, row in df.iterrows():
+                        data_point = {
+                            "src": str(row['source']),
+                            "mt": str(row['translation']),
+                            "ref": str(row.get('reference', ''))
+                        }
+                        eval_data.append(data_point)
                 
-                # Reference alignment
-                with st.spinner("🔗 Aligning reference..."):
-                    ref_pairs = align_texts_strict(src_txt, ref_txt)
-                    ref_map = {p[0]: p[1] for p in ref_pairs}
-                    df["reference"] = df["source"].map(ref_map).fillna("")
-                    
-                    missing_refs = (df["reference"] == "").sum()
-                    if missing_refs > 0:
-                        st.warning(f"⚠️ {missing_refs} segments missing reference")
-
+                st.info(f"📝 Prepared {len(eval_data)} segments for evaluation")
+                
                 # Load model
                 model = load_comet_model(model_id)
                 
                 # Score
-                eval_data = [
-                    {
-                        "src": row.source,
-                        "mt": row.translation,
-                        "ref": row.reference
-                    }
-                    for row in df.itertuples()
-                ]
+                scores = score_with_comet(model, eval_data)
                 
-                df["score"] = score_with_comet(model, eval_data)
-                st.session_state.aligned_df = df
+                # Add scores to dataframe
+                df['score'] = scores
                 
-                # Clear memory after scoring
+                # Add quality category
+                def categorize_quality(score):
+                    if score >= 0.8:
+                        return "Excellent"
+                    elif score >= 0.6:
+                        return "Good"
+                    elif score >= 0.4:
+                        return "Fair"
+                    elif score >= 0.2:
+                        return "Poor"
+                    else:
+                        return "Very Poor"
+                
+                df['quality'] = df['score'].apply(categorize_quality)
+                
+                # Store results
+                st.session_state.results_df = df
+                
                 clear_memory()
                 
                 st.balloons()
                 st.success("🎉 Analysis complete!")
-                    
+                
             except MemoryError:
                 st.error("💾 OUT OF MEMORY!")
                 st.error("Try: 1) Split file into smaller chunks, 2) Use COMET-20, 3) Upgrade Streamlit tier")
@@ -251,67 +280,139 @@ if up_src and up_mt:
                 with st.expander("Show error details"):
                     import traceback
                     st.code(traceback.format_exc())
+    
+    except Exception as e:
+        st.error(f"Failed to read Excel file: {str(e)}")
+        st.info("Make sure your Excel file has at least 2 columns: Source and Translation")
 
-    # Display results
-    if st.session_state.aligned_df is not None:
-        df = st.session_state.aligned_df
+# Display results
+if st.session_state.results_df is not None:
+    df = st.session_state.results_df
+    
+    st.markdown("---")
+    st.header("📊 Results")
+    
+    # Statistics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Average Score", f"{df['score'].mean():.4f}")
+    with col2:
+        st.metric("Median", f"{df['score'].median():.4f}")
+    with col3:
+        st.metric("Std Dev", f"{df['score'].std():.4f}")
+    with col4:
+        st.metric("Segments", len(df))
+    
+    # Quality distribution
+    with st.expander("📈 Quality Distribution"):
+        quality_counts = df['quality'].value_counts()
+        st.bar_chart(quality_counts)
         
-        st.markdown("---")
-        st.header("📊 Results")
-        
-        # Metrics
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Average Score", f"{df['score'].mean():.4f}")
-        with col2:
-            st.metric("Median", f"{df['score'].median():.4f}")
-        with col3:
-            st.metric("Std Dev", f"{df['score'].std():.4f}")
-        with col4:
-            st.metric("Segments", len(df))
-        
-        # Distribution
-        with st.expander("📈 Score Distribution"):
-            import matplotlib.pyplot as plt
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.hist(df['score'], bins=20, edgecolor='black')
-            ax.set_xlabel('COMET Score')
-            ax.set_ylabel('Frequency')
-            ax.set_title('Score Distribution')
-            st.pyplot(fig)
-        
-        # Results table
-        st.subheader("Segment-level Results")
-        st.dataframe(
-            df.style.background_gradient(subset=['score'], cmap="RdYlGn", vmin=0, vmax=1),
-            use_container_width=True,
-            height=400
+        # Show percentages
+        st.subheader("Quality Breakdown")
+        for quality in ["Excellent", "Good", "Fair", "Poor", "Very Poor"]:
+            if quality in quality_counts.index:
+                count = quality_counts[quality]
+                percentage = (count / len(df)) * 100
+                st.write(f"**{quality}**: {count} segments ({percentage:.1f}%)")
+    
+    # Filters
+    st.subheader("🔍 Filter Results")
+    col_f1, col_f2 = st.columns(2)
+    
+    with col_f1:
+        quality_filter = st.multiselect(
+            "Filter by quality",
+            options=["Excellent", "Good", "Fair", "Poor", "Very Poor"],
+            default=[]
         )
+    
+    with col_f2:
+        score_range = st.slider(
+            "Filter by score range",
+            min_value=0.0,
+            max_value=1.0,
+            value=(0.0, 1.0),
+            step=0.01
+        )
+    
+    # Apply filters
+    filtered_df = df.copy()
+    if quality_filter:
+        filtered_df = filtered_df[filtered_df['quality'].isin(quality_filter)]
+    filtered_df = filtered_df[
+        (filtered_df['score'] >= score_range[0]) & 
+        (filtered_df['score'] <= score_range[1])
+    ]
+    
+    st.write(f"Showing {len(filtered_df)} of {len(df)} segments")
+    
+    # Results table
+    st.subheader("Segment-level Results")
+    
+    # Determine which columns to display
+    display_cols = ['source', 'translation']
+    if 'reference' in filtered_df.columns:
+        display_cols.append('reference')
+    display_cols.extend(['score', 'quality'])
+    
+    st.dataframe(
+        filtered_df[display_cols].style.background_gradient(
+            subset=['score'], 
+            cmap="RdYlGn", 
+            vmin=0, 
+            vmax=1
+        ),
+        use_container_width=True,
+        height=400
+    )
+    
+    # Download section
+    st.markdown("---")
+    st.subheader("⬇️ Download Results")
+    
+    col_dl1, col_dl2 = st.columns(2)
+    
+    with col_dl1:
+        # CSV download
+        csv_data = df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "📄 Download CSV",
+            csv_data,
+            "comet_results.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+    
+    with col_dl2:
+        # Excel download with formatting
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Results')
+            
+            # Add statistics sheet
+            stats_data = {
+                'Metric': ['Average', 'Median', 'Std Dev', 'Min', 'Max', 'Count'],
+                'Value': [
+                    df['score'].mean(),
+                    df['score'].median(),
+                    df['score'].std(),
+                    df['score'].min(),
+                    df['score'].max(),
+                    len(df)
+                ]
+            }
+            stats_df = pd.DataFrame(stats_data)
+            stats_df.to_excel(writer, index=False, sheet_name='Statistics')
         
-        # Download buttons
-        st.markdown("---")
-        col_dl1, col_dl2 = st.columns(2)
-        
-        with col_dl1:
-            csv_data = df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "⬇️ Download CSV",
-                csv_data,
-                "lqa_results.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-        
-        with col_dl2:
-            excel_buffer = io.BytesIO()
-            df.to_excel(excel_buffer, index=False, engine='openpyxl')
-            st.download_button(
-                "⬇️ Download Excel",
-                excel_buffer.getvalue(),
-                "lqa_results.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
+        st.download_button(
+            "📊 Download Excel (with stats)",
+            excel_buffer.getvalue(),
+            "comet_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
 
 else:
-    st.info("👆 Upload source, MT, and reference files to begin analysis")
+    if uploaded_file is None:
+        st.info("👆 Upload an Excel file to begin analysis")
