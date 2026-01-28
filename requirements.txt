@@ -1,38 +1,17 @@
-# Core Streamlit app (optimized for memory)
 streamlit==1.31.0
 pandas==2.1.4
 numpy==1.26.4
-
-# PyTorch (CPU only - lighter)
 torch==2.1.2
-
-# Translation quality assessment
 unbabel-comet==2.2.2
-
-# Bertalign - sentence alignment
-git+https://github.com/bfsujason/bertalign.git
-
-# Bertalign dependencies (REQUIRED)
-numba==0.60.0
-faiss-cpu==1.7.4
-googletrans==4.0.0rc1
-sentence-splitter==1.4
-
-# Shared ML dependencies
+openpyxl==3.1.2
+xlrd==2.0.1
 sentence-transformers==2.7.0
 transformers==4.40.2
 sentencepiece==0.1.99
 sacrebleu==2.4.0
 huggingface-hub==0.23.0
+```
 
-# Document processing
-python-docx==1.1.0
-pdfplumber==0.10.3
-openpyxl==3.1.2
-
-# Text processing
-nltk==3.8.1
-regex==2024.5.15
-
-# Note: laser-encoders and fairseq are NOT included
-# They are not used in the code and cause compatibility issues
+### 3. **packages.txt** (Simplified)
+```
+build-essential
