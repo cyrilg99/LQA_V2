@@ -1,6 +1,5 @@
 import os
 import io
-import tempfile
 import pandas as pd
 import streamlit as st
 import torch
@@ -17,13 +16,13 @@ except ImportError as e:
 st.set_page_config(page_title="LQA — COMET Scoring", layout="wide")
 st.title("LQA — COMET Quality Evaluation")
 
-st.info("📊 **Upload pre-aligned Excel files** with Source and MT columns")
+st.info("📊 **Memory-Optimized Excel Processing** - Handles large files by chunking")
 
 # =========================
 # Memory Management
 # =========================
 def clear_memory():
-    """Force garbage collection"""
+    """Aggressive memory cleanup"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -32,28 +31,20 @@ def clear_memory():
 # Excel Processing
 # =========================
 def read_excel_file(file) -> pd.DataFrame:
-    """
-    Read Excel file with source and MT columns.
-    Expected format:
-    - Column 1: Source segments
-    - Column 2: MT (translation) segments
-    - Optional Column 3: Reference segments
-    """
+    """Read and validate Excel file"""
     try:
-        # Read Excel file
         df = pd.read_excel(file, engine='openpyxl')
         
-        # Validate columns
         if len(df.columns) < 2:
             raise ValueError("Excel file must have at least 2 columns (Source, MT)")
         
-        # Rename columns for consistency
+        # Rename columns
         if len(df.columns) == 2:
             df.columns = ['source', 'translation']
         elif len(df.columns) >= 3:
             df.columns = ['source', 'translation', 'reference'] + list(df.columns[3:])
         
-        # Convert to string and clean
+        # Clean data
         df['source'] = df['source'].astype(str).str.strip()
         df['translation'] = df['translation'].astype(str).str.strip()
         if 'reference' in df.columns:
@@ -63,9 +54,7 @@ def read_excel_file(file) -> pd.DataFrame:
         df = df[(df['source'] != '') & (df['source'] != 'nan')]
         df = df[(df['translation'] != '') & (df['translation'] != 'nan')]
         
-        # Reset index
         df = df.reset_index(drop=True)
-        
         return df
         
     except Exception as e:
@@ -73,182 +62,184 @@ def read_excel_file(file) -> pd.DataFrame:
         raise
 
 # =========================
-# COMET Scoring
+# COMET Scoring with Chunking
 # =========================
 @st.cache_resource(show_spinner=True)
 def load_comet_model(model_id: str):
-    """Load COMET model with memory management"""
+    """Load COMET model"""
     try:
         clear_memory()
-        st.info(f"📥 Downloading model: {model_id}")
-        st.info("⏳ First run may take 2-3 minutes...")
         ckpt = download_model(model_id)
         model = load_from_checkpoint(ckpt)
-        st.success(f"✅ Model loaded successfully!")
         return model
     except Exception as e:
-        st.error(f"❌ Failed to load model '{model_id}'")
-        st.error(str(e))
+        st.error(f"Failed to load model: {e}")
         raise
 
-def score_with_comet(model, data: list):
-    """Score with COMET using minimal memory"""
+def score_with_comet_chunked(model, data: list, chunk_size: int = 10):
+    """
+    Score in small chunks to avoid OOM errors.
+    Process 10 segments at a time with memory cleanup between chunks.
+    """
+    all_scores = []
+    total_chunks = (len(data) + chunk_size - 1) // chunk_size
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
     try:
-        clear_memory()
-        gpu_count = 1 if torch.cuda.is_available() else 0
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i:i + chunk_size]
+            chunk_num = i // chunk_size + 1
+            
+            status_text.text(f"Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} segments)...")
+            
+            # Clear memory before each chunk
+            clear_memory()
+            
+            # Score this chunk
+            out = model.predict(chunk, batch_size=1, gpus=0)  # Force CPU, batch=1
+            all_scores.extend(out.scores)
+            
+            # Update progress
+            progress = min((i + chunk_size) / len(data), 1.0)
+            progress_bar.progress(progress)
+            
+            # Clean up
+            clear_memory()
         
-        # Use batch_size=1 for maximum safety on free tier
-        with st.spinner(f"Scoring {len(data)} segments..."):
-            out = model.predict(data, batch_size=1, gpus=gpu_count)
-        return out.scores
+        progress_bar.progress(1.0)
+        status_text.text("✅ Scoring complete!")
+        
+        return all_scores
+        
     except Exception as e:
-        st.error("Failed during scoring")
-        st.error(str(e))
+        st.error(f"Error during scoring: {e}")
         raise
+    finally:
+        clear_memory()
 
 # =========================
-# Main UI Logic
+# Main UI
 # =========================
 if "results_df" not in st.session_state:
     st.session_state.results_df = None
 
-# Sidebar with instructions
 with st.sidebar:
+    st.header("⚙️ Settings")
+    
+    chunk_size = st.slider(
+        "Chunk Size",
+        min_value=5,
+        max_value=50,
+        value=10,
+        step=5,
+        help="Number of segments to process at once. Lower = safer but slower."
+    )
+    
+    st.markdown("---")
     st.header("📋 Instructions")
     st.markdown("""
-    ### Excel File Format
+    ### Excel Format
     
-    Your Excel file should have:
+    **Columns:**
+    - A: Source segments
+    - B: Translation segments
+    - C: Reference (required)
     
-    **Required columns:**
-    1. **Column A**: Source segments
-    2. **Column B**: MT/Translation segments
+    ### Memory Tips
     
-    **Optional:**
-    3. **Column C**: Reference segments
+    **Free tier limits:**
+    - Max ~500 segments recommended
+    - Use chunk size 10-20 for safety
+    - Larger chunks = faster but riskier
     
-    **Example:**
-    | Source | Translation | Reference |
-    |--------|-------------|-----------|
-    | Hello world | Bonjour monde | Bonjour le monde |
-    | How are you? | Comment allez-vous? | Comment vas-tu? |
-    
-    ---
-    
-    ### Available Models
-    
-    **Lightweight (Best for Free Tier):**
-    - ✅ COMET-22 (~1GB RAM)
-    - ✅ COMET-20 (~800MB RAM)
-    
-    **Reference Required:**
-    All public models require a reference 
-    translation in Column C.
-    
-    ---
-    
-    ### Memory Usage
-    
-    **Free Streamlit Cloud: 1GB RAM**
-    
-    Estimated capacity:
-    - Small files (<100 segments): ✅
-    - Medium (100-500): ✅
-    - Large (>500): ⚠️ May need splitting
+    **If app crashes:**
+    - Reduce chunk size to 5
+    - Split Excel file
+    - Process fewer segments
     """)
 
-# File uploader
 st.subheader("📁 Upload Excel File")
 
 uploaded_file = st.file_uploader(
     "Choose an Excel file (.xlsx)",
     type=['xlsx', 'xls'],
-    help="Excel file with Source (A), Translation (B), and optionally Reference (C) columns"
+    help="Excel with Source (A), Translation (B), Reference (C)"
 )
 
 if uploaded_file is not None:
     try:
-        # Read and display Excel file
         with st.spinner("Reading Excel file..."):
             df = read_excel_file(uploaded_file)
         
-        st.success(f"✅ Loaded {len(df)} segments from Excel file")
+        st.success(f"✅ Loaded {len(df)} segments")
         
         # Show preview
-        with st.expander("📄 Preview Data (first 10 rows)"):
+        with st.expander("📄 Preview (first 10 rows)"):
             st.dataframe(df.head(10), use_container_width=True)
         
-        # Check for reference column
+        # Check reference
         has_reference = 'reference' in df.columns and not df['reference'].isna().all()
         
-        if has_reference:
-            st.info("✅ Reference column detected - can use reference-based models")
-        else:
-            st.warning("⚠️ No reference column - only QE models available (require authentication)")
+        if not has_reference:
+            st.error("❌ No reference column detected. Add Column C with reference translations.")
+            st.stop()
+        
+        # File size warning
+        if len(df) > 500:
+            st.warning(f"⚠️ Large file ({len(df)} segments). Consider splitting.")
+            st.info(f"Estimated processing time: {len(df) * 2 // 60} minutes")
         
         # Model selection
-        st.subheader("📊 Select Quality Metric")
+        st.subheader("📊 Select Model")
         
-        if has_reference:
-            metrics = [
-                "COMET-22 (wmt22-comet-da) - Recommended",
-                "eTranslation-COMET - For EU Languages",
-                "COMET-20 (wmt20-comet-da) - Lighter/Faster"
-            ]
-        else:
-            metrics = [
-                "⚠️ No reference detected - Add Column C for reference-based models"
-            ]
-            st.error("Please add a reference column (Column C) to use public models")
-        
-        choice = st.selectbox(
-            "Model",
-            options=metrics,
-            disabled=not has_reference,
-            help="All public models require reference translation"
+        model_choice = st.radio(
+            "Choose model",
+            [
+                "COMET-22 (Best quality, ~1GB RAM)",
+                "COMET-20 (Lighter, ~800MB RAM)"
+            ],
+            help="COMET-20 recommended for files >200 segments"
         )
         
-        # Map to model IDs
-        if has_reference:
-            if "wmt22-comet-da" in choice:
-                model_id = "Unbabel/wmt22-comet-da"
-            elif "eTranslation" in choice:
-                model_id = "Unbabel/eTranslation-COMET"
-            else:  # wmt20
-                model_id = "Unbabel/wmt20-comet-da"
+        if "COMET-22" in model_choice:
+            model_id = "Unbabel/wmt22-comet-da"
+        else:
+            model_id = "Unbabel/wmt20-comet-da"
         
-        # Warning for large files
-        if len(df) > 500:
-            st.warning(f"⚠️ Large file ({len(df)} segments). Consider splitting to avoid memory issues.")
+        st.caption(f"Selected: {model_id}")
+        st.caption(f"Chunk size: {chunk_size} segments per batch")
         
-        # Run analysis button
-        if st.button("🚀 Run COMET Analysis", type="primary", disabled=not has_reference):
+        # Analysis button
+        if st.button("🚀 Run COMET Analysis", type="primary"):
             try:
                 clear_memory()
                 
-                # Prepare data for COMET
+                # Prepare data
                 with st.spinner("Preparing data..."):
                     eval_data = []
                     for idx, row in df.iterrows():
-                        data_point = {
+                        eval_data.append({
                             "src": str(row['source']),
                             "mt": str(row['translation']),
-                            "ref": str(row.get('reference', ''))
-                        }
-                        eval_data.append(data_point)
+                            "ref": str(row['reference'])
+                        })
                 
-                st.info(f"📝 Prepared {len(eval_data)} segments for evaluation")
+                st.info(f"📝 Processing {len(eval_data)} segments in chunks of {chunk_size}")
                 
                 # Load model
-                model = load_comet_model(model_id)
+                with st.spinner("Loading COMET model (may take 2-3 min first time)..."):
+                    model = load_comet_model(model_id)
+                    st.success("✅ Model loaded!")
                 
-                # Score
-                scores = score_with_comet(model, eval_data)
+                # Score with chunking
+                st.subheader("Scoring Progress")
+                scores = score_with_comet_chunked(model, eval_data, chunk_size=chunk_size)
                 
-                # Add scores to dataframe
+                # Add results
                 df['score'] = scores
                 
-                # Add quality category
                 def categorize_quality(score):
                     if score >= 0.8:
                         return "Excellent"
@@ -262,28 +253,29 @@ if uploaded_file is not None:
                         return "Very Poor"
                 
                 df['quality'] = df['score'].apply(categorize_quality)
-                
-                # Store results
                 st.session_state.results_df = df
                 
                 clear_memory()
-                
                 st.balloons()
                 st.success("🎉 Analysis complete!")
                 
             except MemoryError:
                 st.error("💾 OUT OF MEMORY!")
-                st.error("Try: 1) Split file into smaller chunks, 2) Use COMET-20, 3) Upgrade Streamlit tier")
+                st.error("Solutions:")
+                st.markdown("""
+                1. **Reduce chunk size** to 5
+                2. **Split your Excel file** into smaller parts
+                3. **Use COMET-20** (lighter model)
+                4. **Upgrade Streamlit** to paid tier
+                """)
             except Exception as e:
-                st.error("❌ Analysis failed")
-                st.error(str(e))
-                with st.expander("Show error details"):
+                st.error(f"❌ Analysis failed: {str(e)}")
+                with st.expander("Error details"):
                     import traceback
                     st.code(traceback.format_exc())
     
     except Exception as e:
-        st.error(f"Failed to read Excel file: {str(e)}")
-        st.info("Make sure your Excel file has at least 2 columns: Source and Translation")
+        st.error(f"Failed to read Excel: {str(e)}")
 
 # Display results
 if st.session_state.results_df is not None:
@@ -292,10 +284,10 @@ if st.session_state.results_df is not None:
     st.markdown("---")
     st.header("📊 Results")
     
-    # Statistics
+    # Stats
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Average Score", f"{df['score'].mean():.4f}")
+        st.metric("Average", f"{df['score'].mean():.4f}")
     with col2:
         st.metric("Median", f"{df['score'].median():.4f}")
     with col3:
@@ -303,61 +295,17 @@ if st.session_state.results_df is not None:
     with col4:
         st.metric("Segments", len(df))
     
-    # Quality distribution
+    # Quality breakdown
     with st.expander("📈 Quality Distribution"):
         quality_counts = df['quality'].value_counts()
         st.bar_chart(quality_counts)
-        
-        # Show percentages
-        st.subheader("Quality Breakdown")
-        for quality in ["Excellent", "Good", "Fair", "Poor", "Very Poor"]:
-            if quality in quality_counts.index:
-                count = quality_counts[quality]
-                percentage = (count / len(df)) * 100
-                st.write(f"**{quality}**: {count} segments ({percentage:.1f}%)")
-    
-    # Filters
-    st.subheader("🔍 Filter Results")
-    col_f1, col_f2 = st.columns(2)
-    
-    with col_f1:
-        quality_filter = st.multiselect(
-            "Filter by quality",
-            options=["Excellent", "Good", "Fair", "Poor", "Very Poor"],
-            default=[]
-        )
-    
-    with col_f2:
-        score_range = st.slider(
-            "Filter by score range",
-            min_value=0.0,
-            max_value=1.0,
-            value=(0.0, 1.0),
-            step=0.01
-        )
-    
-    # Apply filters
-    filtered_df = df.copy()
-    if quality_filter:
-        filtered_df = filtered_df[filtered_df['quality'].isin(quality_filter)]
-    filtered_df = filtered_df[
-        (filtered_df['score'] >= score_range[0]) & 
-        (filtered_df['score'] <= score_range[1])
-    ]
-    
-    st.write(f"Showing {len(filtered_df)} of {len(df)} segments")
     
     # Results table
-    st.subheader("Segment-level Results")
+    st.subheader("Results Table")
     
-    # Determine which columns to display
-    display_cols = ['source', 'translation']
-    if 'reference' in filtered_df.columns:
-        display_cols.append('reference')
-    display_cols.extend(['score', 'quality'])
-    
+    display_cols = ['source', 'translation', 'reference', 'score', 'quality']
     st.dataframe(
-        filtered_df[display_cols].style.background_gradient(
+        df[display_cols].style.background_gradient(
             subset=['score'], 
             cmap="RdYlGn", 
             vmin=0, 
@@ -367,14 +315,11 @@ if st.session_state.results_df is not None:
         height=400
     )
     
-    # Download section
+    # Downloads
     st.markdown("---")
-    st.subheader("⬇️ Download Results")
-    
     col_dl1, col_dl2 = st.columns(2)
     
     with col_dl1:
-        # CSV download
         csv_data = df.to_csv(index=False).encode('utf-8')
         st.download_button(
             "📄 Download CSV",
@@ -385,28 +330,10 @@ if st.session_state.results_df is not None:
         )
     
     with col_dl2:
-        # Excel download with formatting
         excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Results')
-            
-            # Add statistics sheet
-            stats_data = {
-                'Metric': ['Average', 'Median', 'Std Dev', 'Min', 'Max', 'Count'],
-                'Value': [
-                    df['score'].mean(),
-                    df['score'].median(),
-                    df['score'].std(),
-                    df['score'].min(),
-                    df['score'].max(),
-                    len(df)
-                ]
-            }
-            stats_df = pd.DataFrame(stats_data)
-            stats_df.to_excel(writer, index=False, sheet_name='Statistics')
-        
+        df.to_excel(excel_buffer, index=False, engine='openpyxl')
         st.download_button(
-            "📊 Download Excel (with stats)",
+            "📊 Download Excel",
             excel_buffer.getvalue(),
             "comet_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -415,4 +342,4 @@ if st.session_state.results_df is not None:
 
 else:
     if uploaded_file is None:
-        st.info("👆 Upload an Excel file to begin analysis")
+        st.info("👆 Upload an Excel file to begin")
